@@ -3,9 +3,9 @@
      AGP 8.x rejects a package="..." attribute here. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ------------------------------------------------------------------ -->
+    <!-- ================================================================== -->
     <!-- Permissions                                                          -->
-    <!-- ------------------------------------------------------------------ -->
+    <!-- ================================================================== -->
 
     <!-- Downloading the blocklist + forwarding DNS queries to 8.8.8.8 -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -19,9 +19,9 @@
          but the permission declaration is still required by the OS. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
-    <!-- ------------------------------------------------------------------ -->
+    <!-- ================================================================== -->
     <!-- Application                                                          -->
-    <!-- ------------------------------------------------------------------ -->
+    <!-- ================================================================== -->
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
