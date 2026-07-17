@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.adblocker">
+<!-- The package name lives in app/build.gradle as `namespace`.
+     AGP 8.x rejects a package="..." attribute here. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- ------------------------------------------------------------------ -->
     <!-- Permissions                                                          -->
