@@ -48,7 +48,7 @@ public final class NotificationHelper {
                 : "Blocked " + blocked + (blocked == 1 ? " request" : " requests");
 
         return new Notification.Builder(ctx, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_lock_lock) // replace with your own icon
+                .setSmallIcon(R.drawable.ic_stat_shield)
                 .setContentTitle("Ad Blocker is running")
                 .setContentText(body)
                 .setContentIntent(openApp)
