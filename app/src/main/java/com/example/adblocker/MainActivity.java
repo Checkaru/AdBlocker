@@ -9,6 +9,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -17,57 +20,39 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
+import java.util.List;
+import java.util.Locale;
+
 public class MainActivity extends AppCompatActivity {
 
-    private TextView statusText;
-    private TextView blockedText;
-    private TextView statsText;
+    private TextView statusText, upstreamText, stoppedCount, seenCount, streamText, healthText;
+    private Button   toggleButton;
 
-    // Refreshes the diagnostic panel once a second while the screen is open.
+    private int cAmber, cText, cMuted, cInk;
+
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            renderStats();
+            render();
             ui.postDelayed(this, 1000);
         }
     };
-    private Button   startButton;
-    private Button   stopButton;
 
-    // Receives start / stop / stats broadcasts from AdBlockVpnService.
-    // Registered in onResume, unregistered in onPause -- no leaks.
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context ctx, Intent intent) {
-            if (intent.getAction() == null) return;
-            switch (intent.getAction()) {
-                case AdBlockVpnService.ACTION_VPN_STARTED:
-                    setUiState(true, AdBlockVpnService.blockedCount.get());
-                    break;
-                case AdBlockVpnService.ACTION_VPN_STOPPED:
-                    setUiState(false, 0);
-                    break;
-                case AdBlockVpnService.ACTION_STATS_UPDATE:
-                    int n = intent.getIntExtra(AdBlockVpnService.EXTRA_BLOCKED, 0);
-                    blockedText.setText("Blocked this session: " + n);
-                    break;
-            }
+        @Override public void onReceive(Context ctx, Intent intent) {
+            render();
         }
     };
 
-    // Modern replacement for the deprecated startActivityForResult().
-    // Must be registered as a field, before onCreate() runs.
     private final ActivityResultLauncher<Intent> vpnConsent =
             registerForActivityResult(
                     new ActivityResultContracts.StartActivityForResult(),
                     result -> {
                         if (result.getResultCode() == RESULT_OK) startVpnService();
-                        else Toast.makeText(this, "VPN permission denied",
+                        else Toast.makeText(this, "Blocking needs VPN permission to see DNS",
                                 Toast.LENGTH_SHORT).show();
                     });
 
-    // -------------------------------------------------------------------------
-    // Activity lifecycle
     // -------------------------------------------------------------------------
 
     @Override
@@ -75,39 +60,37 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        statusText  = findViewById(R.id.statusText);
-        blockedText = findViewById(R.id.blockedText);
-        statsText   = findViewById(R.id.statsText);
-        startButton = findViewById(R.id.startButton);
-        stopButton  = findViewById(R.id.stopButton);
+        cAmber = getColor(R.color.amber);
+        cText  = getColor(R.color.text);
+        cMuted = getColor(R.color.muted);
+        cInk   = getColor(R.color.ink);
 
-        startButton.setOnClickListener(v -> requestConsent());
-        stopButton.setOnClickListener(v -> stopVpnService());
+        statusText   = findViewById(R.id.statusText);
+        upstreamText = findViewById(R.id.upstreamText);
+        stoppedCount = findViewById(R.id.stoppedCount);
+        seenCount    = findViewById(R.id.seenCount);
+        streamText   = findViewById(R.id.streamText);
+        healthText   = findViewById(R.id.healthText);
+        toggleButton = findViewById(R.id.toggleButton);
+
+        toggleButton.setOnClickListener(v -> {
+            if (AdBlockVpnService.isRunning) stopVpnService();
+            else requestConsent();
+        });
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-
-        // Register for all three service broadcasts.
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(AdBlockVpnService.ACTION_VPN_STARTED);
-        filter.addAction(AdBlockVpnService.ACTION_VPN_STOPPED);
-        filter.addAction(AdBlockVpnService.ACTION_STATS_UPDATE);
-
-        // API 33+ requires an explicit export flag. NOT_EXPORTED means
-        // only our own app can deliver to this receiver -- correct here
-        // since the broadcasts are also sent with setPackage().
+        IntentFilter f = new IntentFilter();
+        f.addAction(AdBlockVpnService.ACTION_VPN_STARTED);
+        f.addAction(AdBlockVpnService.ACTION_VPN_STOPPED);
+        f.addAction(AdBlockVpnService.ACTION_STATS_UPDATE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(statusReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(statusReceiver, filter);
+            registerReceiver(statusReceiver, f);
         }
-
-        // Sync with real state in case we missed broadcasts while paused
-        // (e.g., user opens app after VPN was already running).
-        boolean running = AdBlockVpnService.isRunning;
-        setUiState(running, running ? AdBlockVpnService.blockedCount.get() : 0);
         ui.post(tick);
     }
 
@@ -118,43 +101,22 @@ public class MainActivity extends AppCompatActivity {
         ui.removeCallbacks(tick);
     }
 
-    /** Live counters straight off the service, so a phone with no adb can still be debugged. */
-    private void renderStats() {
-        statsText.setText(
-                "tunnel     " + (AdBlockVpnService.isRunning ? "up" : "down") + "\n" +
-                "upstream   " + AdBlockVpnService.upstreamInfo + "\n" +
-                "packets    " + AdBlockVpnService.packetsRead.get() + "\n" +
-                "dns seen   " + AdBlockVpnService.queriesSeen.get() + "\n" +
-                "blocked    " + AdBlockVpnService.blockedCount.get() + "\n" +
-                "forwarded  " + AdBlockVpnService.forwarded.get() + "\n" +
-                "answered   " + AdBlockVpnService.answered.get() + "\n" +
-                "timeouts   " + AdBlockVpnService.timeouts.get() + "\n" +
-                "errors     " + AdBlockVpnService.errors.get() + "\n" +
-                "last       " + AdBlockVpnService.lastDomain + "\n" +
-                "error      " + AdBlockVpnService.lastError);
-    }
-
     // -------------------------------------------------------------------------
-    // VPN consent & control
+    // VPN control
     // -------------------------------------------------------------------------
 
     private void requestConsent() {
-        // prepare() returns an Intent if we need to show the consent dialog,
-        // or null if the user already approved this app as a VPN provider.
-        Intent consentIntent = VpnService.prepare(this);
-        if (consentIntent != null) vpnConsent.launch(consentIntent);
+        Intent consent = VpnService.prepare(this);
+        if (consent != null) vpnConsent.launch(consent);
         else startVpnService();
     }
 
     private void startVpnService() {
         startService(new Intent(this, AdBlockVpnService.class)
                 .setAction(AdBlockVpnService.ACTION_START));
-        // Optimistic UI: show "Loading" while the blocklist downloads.
-        // ACTION_VPN_STARTED broadcast will correct it when the tunnel is up.
-        statusText.setText("Loading blocklist\u2026");
-        blockedText.setText("");
-        startButton.setEnabled(false);
-        stopButton.setEnabled(false);
+        statusText.setText("STARTING");
+        upstreamText.setText("finding a resolver that answers");
+        toggleButton.setEnabled(false);
     }
 
     private void stopVpnService() {
@@ -163,13 +125,60 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // -------------------------------------------------------------------------
-    // UI state
+    // Render
     // -------------------------------------------------------------------------
 
-    private void setUiState(boolean running, int blocked) {
-        statusText.setText(running ? "Ad Blocker is running" : "Ad Blocker is off");
-        blockedText.setText(running ? "Blocked this session: " + blocked : "");
-        startButton.setEnabled(!running);
-        stopButton.setEnabled(running);
+    private void render() {
+        boolean on = AdBlockVpnService.isRunning;
+
+        statusText.setText(on ? "BLOCKING" : "OFF");
+        statusText.setTextColor(on ? cText : cMuted);
+
+        upstreamText.setText(on
+                ? "resolving via " + AdBlockVpnService.upstreamInfo
+                : "tap below to start");
+
+        stoppedCount.setText(String.valueOf(AdBlockVpnService.blockedCount.get()));
+        seenCount.setText(String.valueOf(AdBlockVpnService.queriesSeen.get()));
+
+        // Loud when there's something to do, quiet once it's working.
+        toggleButton.setEnabled(true);
+        toggleButton.setText(on ? "Stop" : "Start blocking");
+        toggleButton.setBackgroundResource(on ? R.drawable.pill_outline : R.drawable.pill_filled);
+        toggleButton.setTextColor(on ? cMuted : cInk);
+
+        renderStream(on);
+        renderHealth(on);
+    }
+
+    /** The live feed. Every domain the tunnel saw, newest first, with its verdict. */
+    private void renderStream(boolean on) {
+        List<AdBlockVpnService.Event> events = AdBlockVpnService.recent();
+
+        if (events.isEmpty()) {
+            streamText.setTextColor(cMuted);
+            streamText.setText(on ? "waiting for the first lookup" : "");
+            return;
+        }
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        for (AdBlockVpnService.Event e : events) {
+            String d = e.domain.length() > 34 ? e.domain.substring(0, 33) + "\u2026" : e.domain;
+            int start = sb.length();
+            sb.append(e.blocked ? "\u00d7  " : "\u00b7  ").append(d).append("\n");
+            sb.setSpan(new ForegroundColorSpan(e.blocked ? cAmber : cMuted),
+                    start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        streamText.setText(sb);
+    }
+
+    /** Kept from the debugging build -- it's how we found the DNS bug, so it stays. */
+    private void renderHealth(boolean on) {
+        if (!on) { healthText.setText(""); return; }
+        healthText.setText(String.format(Locale.US,
+                "answered %d   timeouts %d   errors %d",
+                AdBlockVpnService.answered.get(),
+                AdBlockVpnService.timeouts.get(),
+                AdBlockVpnService.errors.get()));
     }
 }
