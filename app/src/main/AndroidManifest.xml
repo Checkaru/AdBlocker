@@ -10,6 +10,10 @@
     <!-- Downloading the blocklist + forwarding DNS queries to 8.8.8.8 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Needed to read the underlying network's real DNS servers, instead of
+         hardcoding a public resolver the ISP may block. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Required on API 28+ to call startForeground() -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
