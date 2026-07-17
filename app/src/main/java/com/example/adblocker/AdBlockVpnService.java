@@ -18,6 +18,7 @@ import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Arrays;
@@ -57,6 +58,29 @@ public class AdBlockVpnService extends VpnService {
     public static final AtomicInteger timeouts    = new AtomicInteger(0);
     public static final AtomicInteger errors      = new AtomicInteger(0);
     public static volatile String upstreamInfo = "-";
+
+    /** One domain we made a decision about. */
+    public static final class Event {
+        public final String  domain;
+        public final boolean blocked;
+        Event(String d, boolean b) { domain = d; blocked = b; }
+    }
+
+    private static final int MAX_RECENT = 16;
+    private static final ArrayDeque<Event> RECENT = new ArrayDeque<>();
+
+    private static void note(String domain, boolean blocked) {
+        synchronized (RECENT) {
+            RECENT.addFirst(new Event(domain, blocked));
+            while (RECENT.size() > MAX_RECENT) RECENT.removeLast();
+        }
+    }
+
+    /** Newest first. Copied, so the UI never iterates a live deque. */
+    public static List<Event> recent() {
+        synchronized (RECENT) { return new ArrayList<>(RECENT); }
+    }
+
     public static volatile String lastDomain = "-";
     public static volatile String lastError  = "-";
 
@@ -64,6 +88,7 @@ public class AdBlockVpnService extends VpnService {
         blockedCount.set(0); packetsRead.set(0); queriesSeen.set(0);
         forwarded.set(0); answered.set(0); timeouts.set(0); errors.set(0);
         lastDomain = "-"; lastError = "-";
+        synchronized (RECENT) { RECENT.clear(); }
     }
 
     /**
@@ -221,7 +246,10 @@ public class AdBlockVpnService extends VpnService {
             queriesSeen.incrementAndGet();
             lastDomain = domain;
 
-            if (isBlocked(domain)) {
+            boolean block = isBlocked(domain);
+            note(domain, block);
+
+            if (block) {
                 // Fast path: answer inline, no network needed.
                 Log.d(TAG, "BLOCKED " + domain);
                 int n = blockedCount.incrementAndGet();
