@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ink">#0D1219</color>     <!-- page          -->
+    <color name="panel">#151D29</color>   <!-- raised surface -->
+    <color name="line">#26313F</color>    <!-- hairlines      -->
+    <color name="text">#E8EEF6</color>    <!-- primary text   -->
+    <color name="muted">#7E8DA3</color>   <!-- secondary text -->
+    <color name="amber">#F0A030</color>   <!-- activity / stopped -->
+</resources>
