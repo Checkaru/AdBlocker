@@ -2,6 +2,10 @@ package com.example.adblocker; // change to match your package
 
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
@@ -11,8 +15,11 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -33,7 +40,8 @@ public class AdBlockVpnService extends VpnService {
 
     private static final String TUN_ADDRESS  = "10.0.0.2";
     private static final String FAKE_DNS     = "10.0.0.1";
-    private static final String UPSTREAM_DNS = "8.8.8.8";
+    /** Tried only if the network hands us nothing usable. */
+    private static final String[] FALLBACK_DNS = {"8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222"};
 
     private static final int DNS_TIMEOUT_MS = 4000;
     private static final int POOL_SIZE      = 16; // concurrent DNS lookups
@@ -48,6 +56,7 @@ public class AdBlockVpnService extends VpnService {
     public static final AtomicInteger answered    = new AtomicInteger(0);
     public static final AtomicInteger timeouts    = new AtomicInteger(0);
     public static final AtomicInteger errors      = new AtomicInteger(0);
+    public static volatile String upstreamInfo = "-";
     public static volatile String lastDomain = "-";
     public static volatile String lastError  = "-";
 
@@ -72,6 +81,8 @@ public class AdBlockVpnService extends VpnService {
     private ParcelFileDescriptor tunInterface;
     private Thread               vpnThread;
     private ExecutorService      dnsPool;
+    private volatile InetAddress upstream;    // the resolver that actually answers
+    private volatile Network     underlying;  // the real (non-VPN) network
     private Set<String>          blocklist = new HashSet<>();
 
     // -------------------------------------------------------------------------
@@ -128,7 +139,22 @@ public class AdBlockVpnService extends VpnService {
             Log.i(TAG, "Blocklist ready: " + blocklist.size() + " domains");
             NotificationHelper.update(this, 0);
 
+            // Do this BEFORE establish(): with no tunnel up yet, these probes
+            // go out over the normal network with nothing to interfere.
+            underlying = pickUnderlying();
+            upstream   = pickUpstream(underlying);
+            if (upstream == null) {
+                upstreamInfo = "none reachable";
+                lastError = "no DNS server answered";
+                Log.e(TAG, "No upstream DNS answered -- refusing to start");
+                stopSelf();
+                return;
+            }
+            upstreamInfo = upstream.getHostAddress();
+            Log.i(TAG, "Upstream DNS: " + upstreamInfo);
+
             Builder builder = new Builder();
+            if (underlying != null) builder.setUnderlyingNetworks(new Network[]{underlying});
             builder.setSession("AdBlocker")
                     .setMtu(1500)
                     .addAddress(TUN_ADDRESS, 32)
@@ -254,13 +280,12 @@ public class AdBlockVpnService extends VpnService {
         DatagramSocket sock = null;
         try {
             sock = new DatagramSocket();
-            protect(sock);                       // keep it out of our own tunnel
+            bindOutside(sock);                   // keep it out of our own tunnel
             sock.setSoTimeout(DNS_TIMEOUT_MS);
 
             byte[] query = new byte[dnsLen];
             System.arraycopy(packet, dnsStart, query, 0, dnsLen);
-            sock.send(new DatagramPacket(query, dnsLen,
-                    InetAddress.getByName(UPSTREAM_DNS), 53));
+            sock.send(new DatagramPacket(query, dnsLen, upstream, 53));
 
             byte[] buf = new byte[4096];
             DatagramPacket resp = new DatagramPacket(buf, buf.length);
@@ -292,6 +317,101 @@ public class AdBlockVpnService extends VpnService {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Keep a socket off our own tunnel. protect() marks it to bypass the VPN;
+     * binding it to the underlying network is the stronger guarantee, since
+     * our own app is otherwise placed on the VPN network like everyone else.
+     */
+    private void bindOutside(DatagramSocket sock) {
+        protect(sock);
+        Network n = underlying;
+        if (n != null) {
+            try { n.bindSocket(sock); } catch (Exception ignored) {}
+        }
+    }
+
+    /** The real internet-capable network behind us -- wifi or cellular, never a VPN. */
+    private Network pickUnderlying() {
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            for (Network n : cm.getAllNetworks()) {
+                NetworkCapabilities c = cm.getNetworkCapabilities(n);
+                if (c == null) continue;
+                if (c.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+                if (!c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
+                return n;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "pickUnderlying: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Find a resolver that actually answers on THIS network.
+     *
+     * The network's own DHCP-provided servers come first: many ISPs drop
+     * traffic to outside resolvers, which is exactly what killed the previous
+     * build -- it hardcoded 8.8.8.8 and every single lookup timed out.
+     * Public resolvers are only a fallback.
+     */
+    private InetAddress pickUpstream(Network net) {
+        List<InetAddress> candidates = new ArrayList<>();
+
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (net != null) {
+                LinkProperties lp = cm.getLinkProperties(net);
+                if (lp != null) {
+                    for (InetAddress a : lp.getDnsServers()) {
+                        if (a instanceof Inet4Address && !candidates.contains(a)) candidates.add(a);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "reading system DNS: " + e.getMessage());
+        }
+
+        for (String f : FALLBACK_DNS) {
+            try {
+                InetAddress a = InetAddress.getByName(f);
+                if (!candidates.contains(a)) candidates.add(a);
+            } catch (Exception ignored) {}
+        }
+
+        for (InetAddress c : candidates) {
+            if (answers(c, net)) {
+                Log.i(TAG, "upstream chosen: " + c.getHostAddress());
+                return c;
+            }
+            Log.w(TAG, "no answer from " + c.getHostAddress());
+        }
+        return null;
+    }
+
+    /** One real lookup against a candidate resolver. */
+    private boolean answers(InetAddress server, Network net) {
+        DatagramSocket s = null;
+        try {
+            s = new DatagramSocket();
+            protect(s);
+            if (net != null) { try { net.bindSocket(s); } catch (Exception ignored) {} }
+            s.setSoTimeout(2500);
+
+            byte[] q = DnsPacket.buildQuery("example.com", 0x4A21);
+            s.send(new DatagramPacket(q, q.length, server, 53));
+
+            byte[] buf = new byte[512];
+            DatagramPacket r = new DatagramPacket(buf, buf.length);
+            s.receive(r);
+            return r.getLength() >= 12 && buf[0] == q[0] && buf[1] == q[1];
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (s != null) s.close();
+        }
+    }
 
     private void broadcast(String action) {
         sendBroadcast(new Intent(action).setPackage(getPackageName()));
