@@ -16,17 +16,16 @@ import java.net.SocketTimeoutException;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class AdBlockVpnService extends VpnService {
 
     private static final String TAG = "AdBlockVpn";
 
-    // Intent actions
     public static final String ACTION_START        = "com.example.adblocker.START";
     public static final String ACTION_STOP         = "com.example.adblocker.STOP";
-
-    // Broadcast actions the Activity listens for
     public static final String ACTION_VPN_STARTED  = "com.example.adblocker.VPN_STARTED";
     public static final String ACTION_VPN_STOPPED  = "com.example.adblocker.VPN_STOPPED";
     public static final String ACTION_STATS_UPDATE = "com.example.adblocker.STATS_UPDATE";
@@ -36,13 +35,27 @@ public class AdBlockVpnService extends VpnService {
     private static final String FAKE_DNS     = "10.0.0.1";
     private static final String UPSTREAM_DNS = "8.8.8.8";
 
-    // Static fields read directly by MainActivity to sync UI on resume
-    // without needing a bound service or a broadcast.
-    public static volatile boolean     isRunning    = false;
-    public static final AtomicInteger  blockedCount = new AtomicInteger(0);
+    private static final int DNS_TIMEOUT_MS = 4000;
+    private static final int POOL_SIZE      = 16; // concurrent DNS lookups
+
+    public static volatile boolean    isRunning    = false;
+    public static final AtomicInteger blockedCount = new AtomicInteger(0);
+
+    /**
+     * Domains that are never blocked, even if a blocklist contains them.
+     * Add anything here that a blocklist breaks -- parent matching applies,
+     * so "example.com" also allows "api.example.com".
+     */
+    private static final Set<String> ALLOWLIST = new HashSet<>();
+    static {
+        // Uncomment or add entries if a blocklist breaks an app you need.
+        // ALLOWLIST.add("app-measurement.com");   // Firebase Analytics
+        // ALLOWLIST.add("crashlytics.com");       // Firebase Crashlytics
+    }
 
     private ParcelFileDescriptor tunInterface;
     private Thread               vpnThread;
+    private ExecutorService      dnsPool;
     private Set<String>          blocklist = new HashSet<>();
 
     // -------------------------------------------------------------------------
@@ -62,15 +75,11 @@ public class AdBlockVpnService extends VpnService {
             stopSelf();
             return START_NOT_STICKY;
         }
-
-        // Android requires startForeground() within 5 seconds of startService().
-        // Do it right here on the main thread, before we touch the background thread.
-        startFgCompat(NotificationHelper.build(this, 0, /* loading= */ true));
+        startFgCompat(NotificationHelper.build(this, 0, true));
         startVpn();
         return START_STICKY;
     }
 
-    /** Handles the API-34 foreground service type requirement. */
     private void startFgCompat(android.app.Notification n) {
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NotificationHelper.NOTIFICATION_ID, n,
@@ -81,50 +90,37 @@ public class AdBlockVpnService extends VpnService {
     }
 
     @Override
-    public void onRevoke() {
-        // Called by the OS when another VPN app takes over, or the user
-        // revokes permission from system settings.
-        stopVpn();
-        stopSelf();
-    }
+    public void onRevoke() { stopVpn(); stopSelf(); }
 
     @Override
-    public void onDestroy() {
-        stopVpn();
-        super.onDestroy();
-    }
+    public void onDestroy() { stopVpn(); super.onDestroy(); }
 
     // -------------------------------------------------------------------------
     // VPN thread
     // -------------------------------------------------------------------------
 
     private void startVpn() {
-        if (vpnThread != null) return; // already running
+        if (vpnThread != null) return;
         blockedCount.set(0);
         vpnThread = new Thread(this::runVpn, "AdBlockVpnThread");
         vpnThread.start();
     }
 
     private void runVpn() {
-        DatagramSocket upstream = null;
         try {
-            // Blocklist loads before the tunnel opens -- so the download itself
-            // doesn't travel through our own VPN.
             blocklist = new BlocklistManager(this).load();
             Log.i(TAG, "Blocklist ready: " + blocklist.size() + " domains");
-
-            // Swap the "Loading…" notification for the live one.
             NotificationHelper.update(this, 0);
 
             Builder builder = new Builder();
             builder.setSession("AdBlocker")
+                    .setMtu(1500)
                     .addAddress(TUN_ADDRESS, 32)
                     .addDnsServer(FAKE_DNS)
                     .addRoute(FAKE_DNS, 32);
 
             tunInterface = builder.establish();
             if (tunInterface == null) {
-                // This happens if the user revoked consent between prepare() and now.
                 Log.e(TAG, "establish() returned null -- consent gone");
                 stopSelf();
                 return;
@@ -137,21 +133,19 @@ public class AdBlockVpnService extends VpnService {
             FileInputStream  in  = new FileInputStream(tunInterface.getFileDescriptor());
             FileOutputStream out = new FileOutputStream(tunInterface.getFileDescriptor());
 
-            upstream = new DatagramSocket();
-            protect(upstream);          // keep upstream traffic out of the tunnel
-            upstream.setSoTimeout(5000);
+            // Forwarding runs off this thread so a slow lookup can never stop
+            // us reading the next packet from the tunnel.
+            dnsPool = Executors.newFixedThreadPool(POOL_SIZE);
 
             byte[] buf = new byte[32767];
-            // read() blocks until a packet arrives. Closing tunInterface (in
-            // stopVpn) makes read() throw IOException, which is the clean exit.
             while (!Thread.interrupted()) {
                 int len = in.read(buf);
-                if (len > 0) handlePacket(buf, len, out, upstream);
+                if (len > 0) handlePacket(buf, len, out);
             }
         } catch (Exception e) {
             Log.i(TAG, "VPN loop ended: " + e.getMessage());
         } finally {
-            if (upstream != null) upstream.close();
+            if (dnsPool != null) dnsPool.shutdownNow();
             closeTun();
             isRunning = false;
             stopForeground(true);
@@ -164,63 +158,59 @@ public class AdBlockVpnService extends VpnService {
     // Packet handling
     // -------------------------------------------------------------------------
 
-    private void handlePacket(byte[] packet, int length,
-                              FileOutputStream out, DatagramSocket upstream) {
+    private void handlePacket(byte[] packet, int length, FileOutputStream out) {
         try {
-            // Check IPv4
-            if ((packet[0] & 0xF0) >> 4 != 4) return;
-
+            if ((packet[0] & 0xF0) >> 4 != 4) return;   // IPv4 only
             int ipHeaderLen = (packet[0] & 0x0F) * 4;
-
-            // Check UDP (protocol 17)
-            if ((packet[9] & 0xFF) != 17) return;
+            if ((packet[9] & 0xFF) != 17) return;       // UDP only
 
             int udp     = ipHeaderLen;
             int dstPort = ((packet[udp + 2] & 0xFF) << 8) | (packet[udp + 3] & 0xFF);
-            if (dstPort != 53) return; // only intercept DNS
+            if (dstPort != 53) return;                  // DNS only
 
             int udpLen   = ((packet[udp + 4] & 0xFF) << 8) | (packet[udp + 5] & 0xFF);
             int dnsStart = udp + 8;
             int dnsLen   = udpLen - 8;
-            if (dnsLen <= 12) return;  // DNS header only, no question section
+            if (dnsLen <= 12) return;
 
             String domain = DnsPacket.extractDomain(packet, dnsStart, dnsLen);
             if (domain == null) return;
 
             if (isBlocked(domain)) {
+                // Fast path: answer inline, no network needed.
                 Log.d(TAG, "BLOCKED " + domain);
                 int n = blockedCount.incrementAndGet();
-
-                // Update the notification every 20 blocks so it doesn't
-                // flood the NotificationManager.
                 if (n % 20 == 0) NotificationHelper.update(this, n);
 
-                // Return NXDOMAIN -- the app thinks the domain doesn't exist.
                 byte[] dnsResp = DnsPacket.buildNxDomain(packet, dnsStart, dnsLen);
                 byte[] reply   = DnsPacket.buildResponsePacket(packet, ipHeaderLen, dnsResp);
-                out.write(reply);
+                synchronized (out) { out.write(reply); }
 
-                // Tell the UI.
                 Intent i = new Intent(ACTION_STATS_UPDATE).setPackage(getPackageName());
                 i.putExtra(EXTRA_BLOCKED, n);
                 sendBroadcast(i);
-
             } else {
-                forwardAndReply(packet, ipHeaderLen, dnsStart, dnsLen, out, upstream);
+                // Copy before handing off -- the read loop reuses `packet`.
+                final byte[] copy = Arrays.copyOf(packet, length);
+                final int ihl = ipHeaderLen, ds = dnsStart, dl = dnsLen;
+                dnsPool.execute(() -> forwardAndReply(copy, ihl, ds, dl, out));
             }
         } catch (Exception e) {
             Log.w(TAG, "Dropped packet: " + e.getMessage());
         }
     }
 
-    /**
-     * Match domain and every parent so one blocklist entry covers all subdomains.
-     * "doubleclick.net" -> also blocks "ad3.doubleclick.net".
-     */
+    /** Allowlist wins over the blocklist. Both match parent domains. */
     private boolean isBlocked(String domain) {
+        if (matches(ALLOWLIST, domain)) return false;
+        return matches(blocklist, domain);
+    }
+
+    /** True if the domain or any parent of it is in the set. */
+    private static boolean matches(Set<String> set, String domain) {
         String d = domain;
         while (d != null) {
-            if (blocklist.contains(d)) return true;
+            if (set.contains(d)) return true;
             int dot = d.indexOf('.');
             d = (dot == -1) ? null : d.substring(dot + 1);
         }
@@ -228,31 +218,48 @@ public class AdBlockVpnService extends VpnService {
     }
 
     /**
-     * Forward a non-blocked query to the real resolver and relay its answer back.
-     * Synchronous (one at a time). Suitable for personal use; a production build
-     * would use a thread pool or coroutines to handle concurrent lookups.
+     * Forward one query upstream and relay the answer back.
+     *
+     * Each query gets its OWN socket. The previous design shared a single
+     * socket across every query: once any lookup timed out, its late answer
+     * was handed back as the NEXT query's answer, and every lookup after that
+     * stayed one behind -- DNS died permanently until the VPN restarted.
+     * A private socket per query makes that impossible, and the transaction-ID
+     * check below rejects any stray packet regardless.
      */
     private void forwardAndReply(byte[] packet, int ipHeaderLen,
-                                 int dnsStart, int dnsLen,
-                                 FileOutputStream out, DatagramSocket upstream) {
+                                 int dnsStart, int dnsLen, FileOutputStream out) {
+        DatagramSocket sock = null;
         try {
+            sock = new DatagramSocket();
+            protect(sock);                       // keep it out of our own tunnel
+            sock.setSoTimeout(DNS_TIMEOUT_MS);
+
             byte[] query = new byte[dnsLen];
             System.arraycopy(packet, dnsStart, query, 0, dnsLen);
+            sock.send(new DatagramPacket(query, dnsLen,
+                    InetAddress.getByName(UPSTREAM_DNS), 53));
 
-            InetAddress server = InetAddress.getByName(UPSTREAM_DNS);
-            upstream.send(new DatagramPacket(query, dnsLen, server, 53));
-
-            byte[] buf  = new byte[4096];
+            byte[] buf = new byte[4096];
             DatagramPacket resp = new DatagramPacket(buf, buf.length);
-            upstream.receive(resp);
+            sock.receive(resp);
+
+            // Bytes 0-1 are the transaction ID; it must match what we asked.
+            if (resp.getLength() < 12 || buf[0] != query[0] || buf[1] != query[1]) {
+                Log.w(TAG, "Transaction ID mismatch, dropped");
+                return;
+            }
 
             byte[] dnsResp = Arrays.copyOf(buf, resp.getLength());
             byte[] reply   = DnsPacket.buildResponsePacket(packet, ipHeaderLen, dnsResp);
-            out.write(reply);
+            synchronized (out) { out.write(reply); }
         } catch (SocketTimeoutException e) {
-            Log.w(TAG, "Upstream DNS timed out");
+            // Stay silent -- the app's own resolver retries. Normal on a
+            // congested link, and it no longer poisons anything.
         } catch (Exception e) {
             Log.w(TAG, "Forward failed: " + e.getMessage());
+        } finally {
+            if (sock != null) sock.close();
         }
     }
 
@@ -261,8 +268,6 @@ public class AdBlockVpnService extends VpnService {
     // -------------------------------------------------------------------------
 
     private void broadcast(String action) {
-        // setPackage() restricts delivery to this app only -- no other app
-        // can receive or inject these broadcasts.
         sendBroadcast(new Intent(action).setPackage(getPackageName()));
     }
 
@@ -270,7 +275,7 @@ public class AdBlockVpnService extends VpnService {
         Thread t = vpnThread;
         vpnThread = null;
         if (t != null) t.interrupt();
-        closeTun(); // closing the file descriptor unblocks in.read()
+        closeTun();
     }
 
     private void closeTun() {
