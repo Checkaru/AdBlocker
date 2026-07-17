@@ -24,7 +24,7 @@
         android:textStyle="bold"
         android:layout_marginBottom="8dp" />
 
-    <!-- "Blocked this session: 1 234" -- hidden when off -->
+    <!-- "Blocked this session: 1 234", hidden when off -->
     <TextView
         android:id="@+id/blockedText"
         android:layout_width="wrap_content"
