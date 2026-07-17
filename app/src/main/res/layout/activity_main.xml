@@ -48,4 +48,14 @@
         android:text="Stop"
         android:enabled="false" />
 
+    <TextView
+        android:id="@+id/statsText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="32dp"
+        android:fontFamily="monospace"
+        android:textSize="13sp"
+        android:textColor="#AAAAAA"
+        android:text="" />
+
 </LinearLayout>
