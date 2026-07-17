@@ -7,6 +7,8 @@ import android.content.IntentFilter;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -19,6 +21,16 @@ public class MainActivity extends AppCompatActivity {
 
     private TextView statusText;
     private TextView blockedText;
+    private TextView statsText;
+
+    // Refreshes the diagnostic panel once a second while the screen is open.
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            renderStats();
+            ui.postDelayed(this, 1000);
+        }
+    };
     private Button   startButton;
     private Button   stopButton;
 
@@ -65,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
 
         statusText  = findViewById(R.id.statusText);
         blockedText = findViewById(R.id.blockedText);
+        statsText   = findViewById(R.id.statsText);
         startButton = findViewById(R.id.startButton);
         stopButton  = findViewById(R.id.stopButton);
 
@@ -95,12 +108,29 @@ public class MainActivity extends AppCompatActivity {
         // (e.g., user opens app after VPN was already running).
         boolean running = AdBlockVpnService.isRunning;
         setUiState(running, running ? AdBlockVpnService.blockedCount.get() : 0);
+        ui.post(tick);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         unregisterReceiver(statusReceiver);
+        ui.removeCallbacks(tick);
+    }
+
+    /** Live counters straight off the service, so a phone with no adb can still be debugged. */
+    private void renderStats() {
+        statsText.setText(
+                "tunnel     " + (AdBlockVpnService.isRunning ? "up" : "down") + "\n" +
+                "packets    " + AdBlockVpnService.packetsRead.get() + "\n" +
+                "dns seen   " + AdBlockVpnService.queriesSeen.get() + "\n" +
+                "blocked    " + AdBlockVpnService.blockedCount.get() + "\n" +
+                "forwarded  " + AdBlockVpnService.forwarded.get() + "\n" +
+                "answered   " + AdBlockVpnService.answered.get() + "\n" +
+                "timeouts   " + AdBlockVpnService.timeouts.get() + "\n" +
+                "errors     " + AdBlockVpnService.errors.get() + "\n" +
+                "last       " + AdBlockVpnService.lastDomain + "\n" +
+                "error      " + AdBlockVpnService.lastError);
     }
 
     // -------------------------------------------------------------------------
