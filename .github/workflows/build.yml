@@ -1,5 +1,10 @@
 name: Build APK
 on: [push]
+
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,11 +28,30 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.6'
+          cache-disabled: true
 
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build.log
+
+      # If the build breaks, post the log as a GitHub Issue so the error is
+      # readable without digging through the Actions UI.
+      - name: Report failure
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo '```' > body.md
+          tail -c 50000 build.log >> body.md
+          echo '```' >> body.md
+          gh issue create --title "Build failed (${GITHUB_SHA:0:7})" --body-file body.md
+          exit 1
 
       - uses: actions/upload-artifact@v4
+        if: steps.build.outcome == 'success'
         with:
           name: AdBlocker-debug
           path: app/build/outputs/apk/debug/app-debug.apk
