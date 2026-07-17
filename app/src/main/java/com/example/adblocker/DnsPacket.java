@@ -54,22 +54,49 @@ public final class DnsPacket {
     }
 
     /**
-     * Turn a DNS query into an NXDOMAIN ("no such domain") response by
-     * flipping a few header bits and echoing the question back. Apps treat
-     * this as "the domain doesn't exist" and give up -- the ad never loads.
+     * Offset just past the question section (QNAME + QTYPE + QCLASS),
+     * or -1 if the question is malformed.
+     */
+    public static int questionEnd(byte[] packet, int dnsStart, int dnsLength) {
+        int pos = dnsStart + 12;
+        int end = dnsStart + dnsLength;
+        while (pos < end) {
+            int len = packet[pos] & 0xFF;
+            if (len == 0) { pos++; break; }
+            if ((len & 0xC0) != 0) return -1; // compression pointer: not valid here
+            pos += 1 + len;
+            if (pos > end) return -1;
+        }
+        pos += 4; // QTYPE + QCLASS
+        return pos <= end ? pos : -1;
+    }
+
+    /**
+     * Turn a DNS query into an NXDOMAIN ("no such domain") response. Apps
+     * treat this as "the domain doesn't exist" and give up -- the ad never
+     * loads.
      *
-     * @return a standalone DNS response message
+     * We keep ONLY the header and the question, dropping everything after it.
+     * That matters: modern resolvers attach an EDNS0 OPT record in the
+     * additional section of every query. If we echo those bytes back while
+     * setting ARCOUNT to 0, the message claims no additional records but has
+     * one anyway -- malformed. The resolver throws the answer away, retries,
+     * gets malformed again, and Android eventually marks our DNS server as
+     * broken and stops using it, which kills name resolution device-wide.
      */
     public static byte[] buildNxDomain(byte[] packet, int dnsStart, int dnsLength) {
-        byte[] dns = new byte[dnsLength];
-        System.arraycopy(packet, dnsStart, dns, 0, dnsLength);
+        int qEnd = questionEnd(packet, dnsStart, dnsLength);
+        int len  = (qEnd == -1) ? dnsLength : (qEnd - dnsStart);
 
-        // Flags (bytes 2-3): QR=1 (response), RD=1, RA=1, RCODE=3 (NXDOMAIN)
+        byte[] dns = new byte[len];
+        System.arraycopy(packet, dnsStart, dns, 0, len);
+
+        // Flags: QR=1 (response), RD=1, RA=1, RCODE=3 (NXDOMAIN)
         dns[2] = (byte) 0x81;
         dns[3] = (byte) 0x83;
 
-        // Zero all the record counts except QDCOUNT (bytes 4-5) which we keep,
-        // so the echoed question stays valid.
+        // Counts now match what the message actually contains.
+        dns[4] = 0; dns[5] = 1;   // QDCOUNT = 1 (the echoed question)
         dns[6] = 0; dns[7] = 0;   // ANCOUNT
         dns[8] = 0; dns[9] = 0;   // NSCOUNT
         dns[10] = 0; dns[11] = 0; // ARCOUNT
