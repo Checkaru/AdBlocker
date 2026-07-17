@@ -4,8 +4,17 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-  <!-- Simple white shield shape -->
-  <path
-      android:fillColor="#FFFFFF"
-      android:pathData="M54,18 L82,33 L82,60 Q82,82 54,94 Q26,82 26,60 L26,33 Z"/>
+
+    <!-- shield -->
+    <path
+        android:fillColor="#F0A030"
+        android:pathData="M54,31 L74,38 L74,55 Q74,69.5 54,77 Q34,69.5 34,55 L34,38 Z" />
+
+    <!-- the cut: reads as a strike-through, and as a slot -->
+    <path
+        android:strokeColor="#0D1219"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:pathData="M42.5,42.5 L65.5,63.5" />
+
 </vector>
