@@ -41,6 +41,22 @@ public class AdBlockVpnService extends VpnService {
     public static volatile boolean    isRunning    = false;
     public static final AtomicInteger blockedCount = new AtomicInteger(0);
 
+    // --- live diagnostics, read by MainActivity ---
+    public static final AtomicInteger packetsRead = new AtomicInteger(0);
+    public static final AtomicInteger queriesSeen = new AtomicInteger(0);
+    public static final AtomicInteger forwarded   = new AtomicInteger(0);
+    public static final AtomicInteger answered    = new AtomicInteger(0);
+    public static final AtomicInteger timeouts    = new AtomicInteger(0);
+    public static final AtomicInteger errors      = new AtomicInteger(0);
+    public static volatile String lastDomain = "-";
+    public static volatile String lastError  = "-";
+
+    public static void resetStats() {
+        blockedCount.set(0); packetsRead.set(0); queriesSeen.set(0);
+        forwarded.set(0); answered.set(0); timeouts.set(0); errors.set(0);
+        lastDomain = "-"; lastError = "-";
+    }
+
     /**
      * Domains that are never blocked, even if a blocklist contains them.
      * Add anything here that a blocklist breaks -- parent matching applies,
@@ -101,7 +117,7 @@ public class AdBlockVpnService extends VpnService {
 
     private void startVpn() {
         if (vpnThread != null) return;
-        blockedCount.set(0);
+        resetStats();
         vpnThread = new Thread(this::runVpn, "AdBlockVpnThread");
         vpnThread.start();
     }
@@ -140,9 +156,10 @@ public class AdBlockVpnService extends VpnService {
             byte[] buf = new byte[32767];
             while (!Thread.interrupted()) {
                 int len = in.read(buf);
-                if (len > 0) handlePacket(buf, len, out);
+                if (len > 0) { packetsRead.incrementAndGet(); handlePacket(buf, len, out); }
             }
         } catch (Exception e) {
+            lastError = String.valueOf(e.getMessage());
             Log.i(TAG, "VPN loop ended: " + e.getMessage());
         } finally {
             if (dnsPool != null) dnsPool.shutdownNow();
@@ -175,6 +192,8 @@ public class AdBlockVpnService extends VpnService {
 
             String domain = DnsPacket.extractDomain(packet, dnsStart, dnsLen);
             if (domain == null) return;
+            queriesSeen.incrementAndGet();
+            lastDomain = domain;
 
             if (isBlocked(domain)) {
                 // Fast path: answer inline, no network needed.
@@ -193,9 +212,12 @@ public class AdBlockVpnService extends VpnService {
                 // Copy before handing off -- the read loop reuses `packet`.
                 final byte[] copy = Arrays.copyOf(packet, length);
                 final int ihl = ipHeaderLen, ds = dnsStart, dl = dnsLen;
+                forwarded.incrementAndGet();
                 dnsPool.execute(() -> forwardAndReply(copy, ihl, ds, dl, out));
             }
         } catch (Exception e) {
+            errors.incrementAndGet();
+            lastError = String.valueOf(e.getMessage());
             Log.w(TAG, "Dropped packet: " + e.getMessage());
         }
     }
@@ -253,10 +275,14 @@ public class AdBlockVpnService extends VpnService {
             byte[] dnsResp = Arrays.copyOf(buf, resp.getLength());
             byte[] reply   = DnsPacket.buildResponsePacket(packet, ipHeaderLen, dnsResp);
             synchronized (out) { out.write(reply); }
+            answered.incrementAndGet();
         } catch (SocketTimeoutException e) {
             // Stay silent -- the app's own resolver retries. Normal on a
             // congested link, and it no longer poisons anything.
+            timeouts.incrementAndGet();
         } catch (Exception e) {
+            errors.incrementAndGet();
+            lastError = String.valueOf(e.getMessage());
             Log.w(TAG, "Forward failed: " + e.getMessage());
         } finally {
             if (sock != null) sock.close();
