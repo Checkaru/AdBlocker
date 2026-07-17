@@ -122,6 +122,7 @@ public class MainActivity extends AppCompatActivity {
     private void renderStats() {
         statsText.setText(
                 "tunnel     " + (AdBlockVpnService.isRunning ? "up" : "down") + "\n" +
+                "upstream   " + AdBlockVpnService.upstreamInfo + "\n" +
                 "packets    " + AdBlockVpnService.packetsRead.get() + "\n" +
                 "dns seen   " + AdBlockVpnService.queriesSeen.get() + "\n" +
                 "blocked    " + AdBlockVpnService.blockedCount.get() + "\n" +
