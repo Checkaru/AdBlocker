@@ -13,6 +13,29 @@ public final class DnsPacket {
     private DnsPacket() {}
 
     /**
+     * Build a minimal DNS A-record query. Used to probe which upstream
+     * resolver actually answers on this network before we commit to one.
+     */
+    public static byte[] buildQuery(String domain, int txid) {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+        b.write(txid >> 8); b.write(txid & 0xFF);
+        b.write(0x01); b.write(0x00);   // flags: RD=1
+        b.write(0); b.write(1);         // QDCOUNT = 1
+        b.write(0); b.write(0);         // ANCOUNT
+        b.write(0); b.write(0);         // NSCOUNT
+        b.write(0); b.write(0);         // ARCOUNT
+        for (String label : domain.split("\\.")) {
+            byte[] l = label.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            b.write(l.length);
+            b.write(l, 0, l.length);
+        }
+        b.write(0);                     // end of QNAME
+        b.write(0); b.write(1);         // QTYPE  = A
+        b.write(0); b.write(1);         // QCLASS = IN
+        return b.toByteArray();
+    }
+
+    /**
      * Pull the queried domain out of a DNS message.
      *
      * A DNS query starts with a 12-byte header, then the QNAME: a series of
